@@ -1,0 +1,31 @@
+name: audio_waveforms
+description: >
+  Vendored audio_waveforms with iOS/macOS Swift Package Manager support for
+  MRE CashBook. Upstream 2.0.2 on pub.dev lacks Package.swift.
+version: 2.0.2
+publish_to: none
+homepage: https://github.com/SimformSolutionsPvtLtd/audio_waveforms
+
+environment:
+  sdk: ^3.11.0
+  flutter: ">=3.41.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.simform.audio_waveforms
+        pluginClass: AudioWaveformsPlugin
+      ios:
+        pluginClass: AudioWaveformsPlugin
+      macos:
+        pluginClass: AudioWaveformsPlugin
