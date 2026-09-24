@@ -4,7 +4,7 @@ description: >
   MRE CashBook. Upstream 2.0.2 on pub.dev lacks Package.swift.
 version: 2.0.2
 publish_to: none
-homepage: https://github.com/SimformSolutionsPvtLtd/audio_waveforms
+homepage: https://github.com/elshoram974/audio_waveforms
 
 environment:
   sdk: ^3.11.0
