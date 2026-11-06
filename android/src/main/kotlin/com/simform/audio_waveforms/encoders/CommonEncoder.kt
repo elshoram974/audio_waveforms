@@ -63,8 +63,6 @@ class CommonEncoder {
      */
     private val availableInputBuffers = ArrayDeque<Int>()
 
-    private val inputLock = Any()
-
     /** End-of-stream has been queued. Further input buffers are ignored. */
     private var eosQueued = false
 
@@ -171,11 +169,12 @@ class CommonEncoder {
 
         mediaCodec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                synchronized(inputLock) {
-                    if (eosQueued) return
-                    availableInputBuffers.addLast(index)
-                    drainInputs(codec)
-                }
+                // Already on [handler]. The microphone thread only posts PCM
+                // here, so it never blocks on the codec and the rest of the
+                // take is not read back as silence.
+                if (eosQueued) return
+                availableInputBuffers.addLast(index)
+                drainInputs(codec)
             }
 
             override fun onOutputBufferAvailable(
@@ -267,8 +266,9 @@ class CommonEncoder {
      * @param buffer The raw audio data to encode
      */
     fun queueInputBuffer(buffer: ByteArray) {
-        synchronized(inputLock) {
-            if (isEncodingComplete || eosQueued) return
+        if (!::handler.isInitialized) return
+        handler.post {
+            if (isEncodingComplete || eosQueued) return@post
             inputQueue.addLast(buffer)
             if (::mediaCodec.isInitialized) drainInputs(mediaCodec)
         }
@@ -281,7 +281,11 @@ class CommonEncoder {
      * is processed, the encoder will be sent an end-of-stream signal.
      */
     fun signalToStop() {
-        synchronized(inputLock) {
+        if (!::handler.isInitialized) {
+            isEncodingComplete = true
+            return
+        }
+        handler.post {
             isEncodingComplete = true
             if (::mediaCodec.isInitialized) drainInputs(mediaCodec)
         }
@@ -299,7 +303,7 @@ class CommonEncoder {
 
     /**
      * Writes queued PCM into every free codec buffer, then one EOS once the
-     * caller has stopped and the queue is empty. Caller holds [inputLock].
+     * caller has stopped and the queue is empty. Runs on the encoder thread.
      */
     private fun drainInputs(codec: MediaCodec) {
         if (draining) return
