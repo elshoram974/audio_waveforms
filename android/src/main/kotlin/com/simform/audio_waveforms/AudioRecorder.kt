@@ -160,6 +160,14 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
                         val milliSeconds = (durationSec * 1000).toLong()
                         sendBytesToFlutter(audioData, rms, milliSeconds)
                     }
+                } else {
+                    // Paused: stay in the loop so resume keeps the same file,
+                    // but don't spin the CPU while the user is not talking.
+                    try {
+                        Thread.sleep(50)
+                    } catch (e: InterruptedException) {
+                        break
+                    }
                 }
             }
         }
@@ -248,6 +256,9 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
     }
 
     private fun getDuration(path: String?): Int {
+        // ADTS has no container index. Opening it here only delayed stop;
+        // the caller already timed the take.
+        if (path == null || path.endsWith(".aac", ignoreCase = true)) return -1
         val mediaMetadataRetriever = MediaMetadataRetriever()
         try {
             mediaMetadataRetriever.setDataSource(path)

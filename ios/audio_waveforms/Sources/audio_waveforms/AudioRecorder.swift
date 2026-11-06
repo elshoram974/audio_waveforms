@@ -7,7 +7,6 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     var path: String?
     var useLegacyNormalization: Bool = false
     var audioUrl: URL?
-    var recordedDuration: CMTime = CMTime.zero
     var flutterChannel: FlutterMethodChannel
     var bytesStreamEngine: RecorderBytesStreamEngine
     init(channel: FlutterMethodChannel){
@@ -76,28 +75,12 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     }
     
     public func stopRecording(_ result: @escaping FlutterResult) {
+        // currentTime is the captured length and already excludes pauses.
+        // Re-opening the file as an asset made stop wait on a second read.
+        let millis = Int((audioRecorder?.currentTime ?? 0) * 1000)
         audioRecorder?.stop()
         bytesStreamEngine.detach()
-        if(audioUrl != nil) {
-            let asset = AVURLAsset(url:  audioUrl!)
-            
-            if #available(iOS 15.0, *) {
-                Task {
-                    do {
-                        recordedDuration = try await asset.load(.duration)
-                        sendResult(result, duration: Int(recordedDuration.seconds * 1000))
-                    } catch let err {
-                        debugPrint(err.localizedDescription)
-                        sendResult(result, duration: Int(CMTime.zero.seconds))
-                    }
-                }
-            } else {
-                recordedDuration = asset.duration
-                sendResult(result, duration: Int(recordedDuration.seconds * 1000))
-            }
-        } else {
-            sendResult(result, duration: Int(CMTime.zero.seconds))
-        }
+        sendResult(result, duration: millis)
         audioRecorder = nil
     }
     

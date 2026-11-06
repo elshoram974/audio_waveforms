@@ -9,7 +9,6 @@ public class AudioRecorder: NSObject {
     private var audioConverter: AVAudioConverter?
     private var path: String?
     private var audioUrl: URL?
-    private var recordedDuration: CMTime = CMTime.zero
     private var flutterChannel: FlutterMethodChannel
 
     // Recording state
@@ -311,32 +310,12 @@ public class AudioRecorder: NSObject {
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
 
+        let frames = audioFile?.length ?? 0
+        let rate = audioFile?.fileFormat.sampleRate ?? 0
+        let millis = rate > 0 ? Int((Double(frames) / rate) * 1000) : 0
         audioFile = nil
         audioConverter = nil
-
-        // Get duration
-        if let audioUrl = audioUrl {
-            let asset = AVURLAsset(url: audioUrl)
-
-            if #available(macOS 12.0, *) {
-                Task {
-                    do {
-                        recordedDuration = try await asset.load(.duration)
-                        sendResult(
-                            result,
-                            duration: Int(recordedDuration.seconds * 1000))
-                    } catch {
-                        sendResult(result, duration: Int(CMTime.zero.seconds))
-                    }
-                }
-            } else {
-                recordedDuration = asset.duration
-                sendResult(
-                    result, duration: Int(recordedDuration.seconds * 1000))
-            }
-        } else {
-            sendResult(result, duration: Int(CMTime.zero.seconds))
-        }
+        sendResult(result, duration: millis)
     }
 
     private func sendResult(_ result: @escaping FlutterResult, duration: Int) {

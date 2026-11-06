@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import com.simform.audio_waveforms.Constants
 import com.simform.audio_waveforms.Encoder
@@ -107,7 +108,11 @@ class CommonEncoder {
         this.recorderSettings = recorderSettings
         encoder = recorderSettings.encoder
         completionCallback = onEncodingCompleted
-        var useMediaMuxer = encoder.useMediaMuxer
+        // .aac is raw ADTS: each frame is already a finished packet, so stop
+        // only flushes the codec. MPEG-4 would rewrite the file index here,
+        // which is the multi-second stall on some Android devices.
+        val rawAac = recorderSettings.path.orEmpty().endsWith(".aac", ignoreCase = true)
+        var useMediaMuxer = encoder.useMediaMuxer && !rawAac
         var format: MediaFormat
         try {
             outputStream = FileOutputStream(recorderSettings.path!!)
@@ -219,7 +224,7 @@ class CommonEncoder {
                     val encodedData = ByteArray(info.size)
                     buffer.get(encodedData)
                     
-                    addADTSIfAAC()
+                    addADTSIfAAC(info.size)
                     outputStream.write(encodedData)
                 }
 
@@ -329,12 +334,13 @@ class CommonEncoder {
      * AAC raw frames require an ADTS header to be properly recognized by players.
      * This method adds the header when necessary based on the encoder type and file extension.
      */
-    private fun addADTSIfAAC() {
-        if ((encoder.isAAC && recorderSettings.path!!.endsWith(
-                Constants.AAC_FILE_EXTENSION
-            ))
+    private fun addADTSIfAAC(frameLength: Int) {
+        if (encoder.isAAC && recorderSettings.path.orEmpty().endsWith(
+                Constants.AAC_FILE_EXTENSION,
+                ignoreCase = true,
+            )
         ) {
-            outputStream.write(addADTSPacket(encoder.bufferSize, recorderSettings.sampleRate))
+            outputStream.write(addADTSPacket(frameLength, recorderSettings.sampleRate))
         }
     }
 
@@ -403,18 +409,25 @@ class CommonEncoder {
         if (isEncoderStopped) return
         isEncoderStopped = true
 
+        val callback = completionCallback
+        completionCallback = null
         try {
             mediaCodec.stop()
             mediaCodec.release()
             mediaMuxer?.stop()
             mediaMuxer?.release()
             outputStream.close()
-            handlerThread.quitSafely()
-            handlerThread.join()
-            completionCallback?.invoke()
         } catch (e: Exception) {
             Log.e(Constants.LOG_TAG, "Error stopping encoder: ${e.message}")
         }
+        // The codec callback runs on handlerThread. Joining that thread from
+        // here never returns, so stop() used to sit until the Dart timeout
+        // and the recording was reported as lost.
+        handlerThread.quitSafely()
+        if (Looper.myLooper() != handlerThread.looper) {
+            handlerThread.join()
+        }
+        Handler(Looper.getMainLooper()).post { callback?.invoke() }
 
         // Reset state for next recording
         isMuxerStarted = false
