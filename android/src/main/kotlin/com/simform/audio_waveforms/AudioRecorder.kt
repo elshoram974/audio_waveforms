@@ -135,6 +135,9 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
             )
             wavEncoder?.start(result)
         } else {
+            // A codec that ran out of input buffers must not be reused: the
+            // next take would start already starved and record silence.
+            commonEncoder = CommonEncoder()
             commonEncoder.initCodec(recorderSettings = recorderSettings!!, result = result) {
                 recordingThread?.join()
             }

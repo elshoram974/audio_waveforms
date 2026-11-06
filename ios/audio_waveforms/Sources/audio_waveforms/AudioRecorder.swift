@@ -13,6 +13,9 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     /// input takes the microphone away from AVAudioRecorder, so the wave
     /// dies and the file stops receiving audio while the clock keeps going.
     var meterTimer: Timer?
+    var captureActive = false
+    var pausedByUser = false
+    var interruptionObserver: NSObjectProtocol?
     init(channel: FlutterMethodChannel){
         flutterChannel = channel
         bytesStreamEngine = RecorderBytesStreamEngine(channel: channel)
@@ -66,6 +69,9 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
             
             audioRecorder?.delegate = self
             audioRecorder?.isMeteringEnabled = true
+            captureActive = true
+            pausedByUser = false
+            observeInterruptions()
             audioRecorder?.record()
             startMetering()
             result(true)
@@ -78,6 +84,8 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
         // currentTime is the captured length and already excludes pauses.
         // Re-opening the file as an asset made stop wait on a second read.
         let millis = Int((audioRecorder?.currentTime ?? 0) * 1000)
+        captureActive = false
+        stopObservingInterruptions()
         stopMetering()
         audioRecorder?.stop()
         sendResult(result, duration: millis)
@@ -103,7 +111,9 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     private func publishMeter() {
         guard let recorder = audioRecorder, recorder.isRecording else { return }
         recorder.updateMeters()
-        let db = recorder.averagePower(forChannel: 0)
+        // Peak, not average. Average speech sits near -40 dB, which draws as
+        // a flat line. Peak is the level a voice-note bar is meant to show.
+        let db = recorder.peakPower(forChannel: 0)
         let linear = pow(10.0, Double(db) / 20.0)
         let normalized = min(max(linear, 0), 1)
         flutterChannel.invokeMethod(Constants.onAudioChunk, arguments: [
@@ -112,6 +122,36 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
         ])
     }
     
+    /// A call, a route change, or another player grabbing the session pauses
+    /// the recorder and the rest of the file is silence while the clock runs.
+    /// When the interruption ends, start writing again.
+    private func observeInterruptions() {
+        stopObservingInterruptions()
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleInterruption(notification)
+        }
+    }
+
+    private func stopObservingInterruptions() {
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+        interruptionObserver = nil
+    }
+
+    private func handleInterruption(_ notification: Notification) {
+        guard captureActive, !pausedByUser, let recorder = audioRecorder else { return }
+        guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue),
+              type == .ended else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        recorder.record()
+    }
+
     private func sendResult(_ result: @escaping FlutterResult, duration:Int){
         var params = [String:Any?]()
         params[Constants.resultFilePath] = path
@@ -120,11 +160,13 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     }
     
     public func pauseRecording(_ result: @escaping FlutterResult) {
+        pausedByUser = true
         audioRecorder?.pause()
         result(false)
     }
     
     public func resumeRecording(_ result: @escaping FlutterResult) {
+        pausedByUser = false
         audioRecorder?.record()
         result(true)
     }

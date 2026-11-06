@@ -15,7 +15,7 @@ import com.simform.audio_waveforms.RecorderSettings
 import com.simform.audio_waveforms.isEof
 import io.flutter.plugin.common.MethodChannel
 import java.io.FileOutputStream
-import java.util.LinkedList
+import java.util.ArrayDeque
 
 /**
  * CommonEncoder provides a unified interface for audio encoding functionality across
@@ -52,11 +52,24 @@ class CommonEncoder {
     /** MediaMuxer instance for container formats (optional) */
     private var mediaMuxer: MediaMuxer? = null
 
-    /** Queue for audio data waiting to be encoded */
-    private val inputQueue = LinkedList<ByteArray>()
-    
-    /** Current available input buffer index (-1 if none available) */
-    private var currentInputBufferIndex = -1
+    /** PCM waiting for a codec input buffer. */
+    private val inputQueue = ArrayDeque<ByteArray>()
+
+    /**
+     * Every input buffer the codec has handed us and we have not queued back.
+     * A single index field drops the previous one: MediaCodec then never
+     * returns that buffer, the pool drains, and the rest of the take is
+     * silence while the clock keeps running.
+     */
+    private val availableInputBuffers = ArrayDeque<Int>()
+
+    private val inputLock = Any()
+
+    /** End-of-stream has been queued. Further input buffers are ignored. */
+    private var eosQueued = false
+
+    /** drainInputs is on the stack. A nested codec callback must not re-enter. */
+    private var draining = false
 
     /** Flag indicating if the muxer has been started */
     private var isMuxerStarted = false
@@ -100,7 +113,8 @@ class CommonEncoder {
         isEncodingComplete = false
         isEncoderStopped = false
         inputQueue.clear()
-        currentInputBufferIndex = -1
+        availableInputBuffers.clear()
+        eosQueued = false
         totalBytesEncoded = 0L
         firstOutputTimestamp = -1L
         lastOutputTimestamp = 0L
@@ -157,21 +171,10 @@ class CommonEncoder {
 
         mediaCodec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                if (isEncodingComplete && inputQueue.isEmpty()) {
-                    // Use the last calculated presentation time for EOF, not system time
-                    val eofTimestamp = if (totalBytesEncoded > 0) {
-                        val bytesPerSample = 2L
-                        val channels = 1L
-                        (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
-                    } else {
-                        0L
-                    }
-                    codec.queueInputBuffer(
-                        index, 0, 0, eofTimestamp, MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                    )
-                } else {
-                    currentInputBufferIndex = index
-                    feedEncoder()
+                synchronized(inputLock) {
+                    if (eosQueued) return
+                    availableInputBuffers.addLast(index)
+                    drainInputs(codec)
                 }
             }
 
@@ -264,12 +267,10 @@ class CommonEncoder {
      * @param buffer The raw audio data to encode
      */
     fun queueInputBuffer(buffer: ByteArray) {
-        synchronized(inputQueue) {
-            inputQueue.add(buffer)
-        }
-
-        if (currentInputBufferIndex >= 0) {
-            feedEncoder()
+        synchronized(inputLock) {
+            if (isEncodingComplete || eosQueued) return
+            inputQueue.addLast(buffer)
+            if (::mediaCodec.isInitialized) drainInputs(mediaCodec)
         }
     }
 
@@ -280,7 +281,10 @@ class CommonEncoder {
      * is processed, the encoder will be sent an end-of-stream signal.
      */
     fun signalToStop() {
-        isEncodingComplete = true
+        synchronized(inputLock) {
+            isEncodingComplete = true
+            if (::mediaCodec.isInitialized) drainInputs(mediaCodec)
+        }
     }
 
     /**
@@ -294,38 +298,66 @@ class CommonEncoder {
 
 
     /**
-     * Feeds available audio data to the encoder
-     * 
-     * This method is called when both audio data is available in the queue
-     * and an input buffer is available from the encoder. It's synchronized
-     * to ensure thread safety when accessing the input queue.
-     * 
-     * The presentation timestamp is calculated based on the amount of audio data
-     * encoded so far, starting from 0. This ensures monotonic timestamps that
-     * represent the actual audio timeline for proper playback and looping.
+     * Writes queued PCM into every free codec buffer, then one EOS once the
+     * caller has stopped and the queue is empty. Caller holds [inputLock].
      */
-    private fun feedEncoder() {
-        synchronized(inputQueue) {
-            if (inputQueue.isEmpty() || currentInputBufferIndex < 0) return
-
-            val data = inputQueue.poll() ?: return
-            val inputBuffer = mediaCodec.getInputBuffer(currentInputBufferIndex) ?: return
+    private fun drainInputs(codec: MediaCodec) {
+        if (draining) return
+        draining = true
+        try {
+        while (availableInputBuffers.isNotEmpty()) {
+            if (inputQueue.isEmpty()) {
+                if (isEncodingComplete && !eosQueued) {
+                    queueEos(codec, availableInputBuffers.removeFirst())
+                }
+                return
+            }
+            val index = availableInputBuffers.removeFirst()
+            val inputBuffer = codec.getInputBuffer(index)
+            if (inputBuffer == null) continue
             inputBuffer.clear()
-            inputBuffer.put(data)
-
-            // Calculate presentation time based on actual audio data encoded
-            // Formula: presentationTimeUs = (totalBytes * 1,000,000) / (sampleRate * channels * bytesPerSample)
-            // For 16-bit PCM mono: bytesPerSample = 2, channels = 1
-            val bytesPerSample = 2L  // 16-bit = 2 bytes
-            val channels = 1L  // Mono
-            val presentationTimeUs = (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * channels * bytesPerSample)
-            totalBytesEncoded += data.size
-            
-            mediaCodec.queueInputBuffer(
-                currentInputBufferIndex, 0, data.size, presentationTimeUs, 0
-            )
-            currentInputBufferIndex = -1
+            var filled = 0
+            val capacity = inputBuffer.capacity()
+            while (inputQueue.isNotEmpty() && filled < capacity) {
+                val data = inputQueue.first()
+                val room = capacity - filled
+                if (data.size <= room) {
+                    inputBuffer.put(data)
+                    filled += data.size
+                    inputQueue.removeFirst()
+                } else {
+                    inputBuffer.put(data, 0, room)
+                    filled += room
+                    inputQueue.removeFirst()
+                    inputQueue.addFirst(data.copyOfRange(room, data.size))
+                    break
+                }
+            }
+            if (filled == 0) {
+                availableInputBuffers.addFirst(index)
+                return
+            }
+            // 16-bit mono: timestamp follows the samples actually queued.
+            val presentationTimeUs =
+                (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * 2L)
+            totalBytesEncoded += filled
+            codec.queueInputBuffer(index, 0, filled, presentationTimeUs, 0)
         }
+        } finally {
+            draining = false
+        }
+    }
+
+    private fun queueEos(codec: MediaCodec, index: Int) {
+        eosQueued = true
+        val eofTimestamp = if (totalBytesEncoded > 0) {
+            (totalBytesEncoded * 1_000_000L) / (recorderSettings.sampleRate * 2L)
+        } else {
+            0L
+        }
+        codec.queueInputBuffer(
+            index, 0, 0, eofTimestamp, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+        )
     }
 
     /**
@@ -434,7 +466,8 @@ class CommonEncoder {
         trackIndex = -1
         isEncodingComplete = false
         inputQueue.clear()
-        currentInputBufferIndex = -1
+        availableInputBuffers.clear()
+        eosQueued = false
         totalBytesEncoded = 0L
         firstOutputTimestamp = -1L
         lastOutputTimestamp = 0L
