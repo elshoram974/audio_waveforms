@@ -6,12 +6,11 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.MediaMetadataRetriever
-import android.media.MediaMetadataRetriever.METADATA_KEY_DURATION
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
@@ -126,6 +125,7 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
             )
             return
         }
+        lastLevelAtMs = 0L
         audioRecord?.startRecording()
         recorderState = RecorderState.Recording
         if (encoder?.encodeForWav == true) {
@@ -165,7 +165,7 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
                             totalSamples.toDouble() / (recorderSettings?.sampleRate
                                 ?: Constants.DEFAULT_SAMPLE_RATE)
                         val milliSeconds = (durationSec * 1000).toLong()
-                        sendBytesToFlutter(audioData, rms, milliSeconds)
+                        sendLevelToFlutter(rms, milliSeconds)
                     }
                 } else {
                     // Paused: stay in the loop so resume keeps the same file,
@@ -184,16 +184,22 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
 
     fun stop(result: Result) {
         try {
+            val sampleRate = recorderSettings?.sampleRate ?: Constants.DEFAULT_SAMPLE_RATE
+            val capturedMs = if (sampleRate > 0) {
+                (totalSamples * 1000L / sampleRate).toInt()
+            } else {
+                -1
+            }
             audioRecord?.stop()
             totalSamples = 0L
             recorderState = RecorderState.Stopped
             if (encoder?.encodeForWav == true) {
                 wavEncoder?.stop(result)
                 recordingThread?.join()
-                sendRecordingResult(result)
+                sendRecordingResult(result, capturedMs)
             } else {
                 commonEncoder.setOnEncodingCompleted {
-                    sendRecordingResult(result)
+                    sendRecordingResult(result, capturedMs)
                 }
                 commonEncoder.signalToStop()
             }
@@ -205,18 +211,26 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
         release()
     }
 
-    private fun sendRecordingResult(result: Result) {
-        val duration = getDuration(recorderSettings?.path)
+    private fun sendRecordingResult(result: Result, capturedMs: Int) {
+        // The sample clock is already known. Opening the file with
+        // MediaMetadataRetriever here is what held "Saving…" on screen.
         val hashMap = HashMap<String, Any?>()
         hashMap[Constants.resultFilePath] = recorderSettings?.path
-        hashMap[Constants.resultDuration] = duration
+        hashMap[Constants.resultDuration] = capturedMs
         result.success(hashMap)
     }
 
-    private fun sendBytesToFlutter(chunk: ByteArray, rms: Double, milliSeconds: Long) {
+    private var lastLevelAtMs = 0L
+
+    /// Level only, and not on every buffer. Shipping the raw PCM on each read
+    /// filled the platform channel until stop() sat behind it and the wave
+    /// stopped moving, which the app then treated as a dead microphone.
+    private fun sendLevelToFlutter(rms: Double, milliSeconds: Long) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastLevelAtMs < 100L) return
+        lastLevelAtMs = now
         val args: MutableMap<String, Any?> = HashMap()
         args[Constants.normalisedRms] = rms
-        args[Constants.bytes] = chunk
         args[Constants.recordedDuration] = milliSeconds
         Handler(Looper.getMainLooper()).post {
             channel.invokeMethod(Constants.onAudioChunk, args)
@@ -260,22 +274,5 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
 
         audioRecord = null
         recorderState = RecorderState.Disposed
-    }
-
-    private fun getDuration(path: String?): Int {
-        // ADTS has no container index. Opening it here only delayed stop;
-        // the caller already timed the take.
-        if (path == null || path.endsWith(".aac", ignoreCase = true)) return -1
-        val mediaMetadataRetriever = MediaMetadataRetriever()
-        try {
-            mediaMetadataRetriever.setDataSource(path)
-            val duration = mediaMetadataRetriever.extractMetadata(METADATA_KEY_DURATION)
-            return duration?.toInt() ?: -1
-        } catch (e: Exception) {
-            Log.e(LOG_TAG, "Error getting duration: ${e.message}")
-        } finally {
-            mediaMetadataRetriever.release()
-        }
-        return -1
     }
 }

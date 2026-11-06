@@ -88,7 +88,7 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     /// is actually capturing, because it comes from the same recorder.
     private func startMetering() {
         stopMetering()
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.publishMeter()
         }
         RunLoop.main.add(timer, forMode: .common)
