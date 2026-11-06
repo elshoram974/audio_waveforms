@@ -150,7 +150,14 @@ class AudioRecorder : PluginRegistry.RequestPermissionsResultListener {
                         if (encoder?.encodeForWav == true) {
                             wavEncoder?.writePcmData(audioData)
                         } else {
-                            commonEncoder.queueInputBuffer(audioData)
+                            try {
+                                commonEncoder.queueInputBuffer(audioData)
+                            } catch (e: Exception) {
+                                // A codec error used to kill this thread, so
+                                // the wave froze and the rest of the take was
+                                // never written. Keep reading the microphone.
+                                Log.e(LOG_TAG, "Encoder dropped a buffer: ${e.message}")
+                            }
                         }
                         val rms = calculateRms(audioData, read)
                         totalSamples += read / channelCount

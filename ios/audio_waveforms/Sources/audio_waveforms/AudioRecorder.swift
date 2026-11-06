@@ -9,6 +9,10 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     var audioUrl: URL?
     var flutterChannel: FlutterMethodChannel
     var bytesStreamEngine: RecorderBytesStreamEngine
+    /// Reads the recorder's own meters. A second AVAudioEngine on the same
+    /// input takes the microphone away from AVAudioRecorder, so the wave
+    /// dies and the file stops receiving audio while the clock keeps going.
+    var meterTimer: Timer?
     init(channel: FlutterMethodChannel){
         flutterChannel = channel
         bytesStreamEngine = RecorderBytesStreamEngine(channel: channel)
@@ -63,11 +67,7 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
             audioRecorder?.delegate = self
             audioRecorder?.isMeteringEnabled = true
             audioRecorder?.record()
-            bytesStreamEngine
-                .attach(
-                    result: result,
-                    sampleRate:  recordingSettings.sampleRate ?? Constants.defaultSampleRate
-                )
+            startMetering()
             result(true)
         } catch {
             result(FlutterError(code: Constants.audioWaveforms, message: "Failed to start recording", details: error.localizedDescription))
@@ -78,10 +78,38 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
         // currentTime is the captured length and already excludes pauses.
         // Re-opening the file as an asset made stop wait on a second read.
         let millis = Int((audioRecorder?.currentTime ?? 0) * 1000)
+        stopMetering()
         audioRecorder?.stop()
-        bytesStreamEngine.detach()
         sendResult(result, duration: millis)
         audioRecorder = nil
+    }
+
+    /// Publishes a level and the recorder clock. The level is what the file
+    /// is actually capturing, because it comes from the same recorder.
+    private func startMetering() {
+        stopMetering()
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.publishMeter()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    private func stopMetering() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+    }
+
+    private func publishMeter() {
+        guard let recorder = audioRecorder, recorder.isRecording else { return }
+        recorder.updateMeters()
+        let db = recorder.averagePower(forChannel: 0)
+        let linear = pow(10.0, Double(db) / 20.0)
+        let normalized = min(max(linear, 0), 1)
+        flutterChannel.invokeMethod(Constants.onAudioChunk, arguments: [
+            Constants.normalisedRms: normalized,
+            Constants.recordedDuration: Int(recorder.currentTime * 1000),
+        ])
     }
     
     private func sendResult(_ result: @escaping FlutterResult, duration:Int){
@@ -93,13 +121,11 @@ public class AudioRecorder: NSObject, AVAudioRecorderDelegate{
     
     public func pauseRecording(_ result: @escaping FlutterResult) {
         audioRecorder?.pause()
-        bytesStreamEngine.togglePause()
         result(false)
     }
     
     public func resumeRecording(_ result: @escaping FlutterResult) {
         audioRecorder?.record()
-        bytesStreamEngine.togglePause();
         result(true)
     }
     
